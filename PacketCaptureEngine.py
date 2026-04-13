@@ -1,73 +1,76 @@
-from scapy.all import sniff, IP, TCP, UDP
-from collections import defaultdict
-import queue
-import threading
-from datetime import datetime
-import json
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
 
-class PacketCaptureEngine:
-    def __init__(self, interface = None, packet_queue_maxsize = 10000):
-        self.interface = interface
-        self.packet_queue = queue.Queue(maxsize=packet_queue_maxsize)
-        self.capture_thread = None
-        self.stop_event = threading.Event()
-        self.packet_stats = defaultdict(int)
+train_df = pd.read_csv("Monday-WorkingHours.pcap_ISCX.csv")
+test_df = pd.read_csv("Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv")
 
-    def packet_callback(self, packet): # 
-        try:
-            if IP not in packet:
-                return
-            
-            packet_info = {
-                'timestamp': datetime.now().isoformat(),
-                'src_ip': packet[IP].src,
-                'dst_ip': packet[IP].dst,
-                'protocol': packet[IP].proto, # 6 for TCP, 17 for UDP
-                'ttl': packet[IP].ttl,
-                'length': len(packet)
-            }
+train_df.columns = train_df.columns.str.strip()
+test_df.columns = test_df.columns.str.strip()
+ 
+print("=== train columns ===")
+print(train_df.columns.tolist())
+print("\n=== test columns ===")
+print(test_df.columns.tolist())
 
-            if TCP in packet:
-                packet_info['src_port'] = packet[TCP].sport
-                packet_info['dst_port'] = packet[TCP].dport
-                packet_info['flags'] = packet[TCP].flags
-                packet_info['seq'] = packet[TCP].seq
+# 사용할 feature 선택
+features = [
+    "Destination Port",
+    "Flow Duration",
+    "Total Fwd Packets",
+    "Total Backward Packets",
+    "Flow IAT Mean",
+    "Flow IAT Std",
+    "Packet Length Mean",
+    "Packet Length Std",
+    "Flow Packets/s",
+    "Flow Bytes/s"
+]
+X_train = train_df[features].copy()
+X_test = test_df[features].copy()
 
-            elif UDP in packet:
-                packet_info['src_port'] = packet[UDP].sport
-                packet_info['dst_port'] = packet[UDP].dport
+y_train = train_df["Label"].copy()
+y_test = test_df["Label"].copy()
 
-            if not self.packet_queue.full():
-                self.packet_queue.put(packet_info)
-            else:
-                try:
-                    self.packet_queue.get_nowait()  # 오래된 패킷 제거
-                    self.packet_queue.put(packet_info)
+X_train.replace([np.inf, -np.inf], np.nan, inplace=True)
+X_test.replace([np.inf, -np.inf], np.nan, inplace=True)
 
-                except queue.Empty:
-                    pass  # 큐가 비어있을때 발생할 수 있는 예외 처리
+for col in features:
+    X_train[col] = pd.to_numeric(X_train[col], errors="coerce")
+    X_test[col] = pd.to_numeric(X_test[col], errors="coerce")
 
-            self.packet_stats['captured'] += 1
+train_mask = X_train.notna().all(axis=1)
+test_mask = X_test.notna().all(axis=1)
 
-        except Exception as e:
-            self.packet_stats['errors'] += 1
-            print(f"Error processing packet: {e}")
+X_train = X_train[train_mask].reset_index(drop=True)
+X_test = X_test[test_mask].reset_index(drop=True)
+y_train = y_train[train_mask].reset_index(drop=True)
+y_test = y_test[test_mask].reset_index(drop=True)
+
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+X_train_scaled_df = pd.DataFrame(X_train_scaled, columns=features)
+X_test_scaled_df = pd.DataFrame(X_test_scaled, columns=features)
+
+train_processed = X_train_scaled_df.copy()
+train_processed["Label"] = y_train
+
+test_processed = X_test_scaled_df.copy()
+test_processed["Label"] = y_test
 
 
-    def start_capture(self): 
-        self.capture_thread = threading.Thread(target=self._sniff_packets, daemon=True)
-        self.capture_thread.start()
-        print(f"Packet capture started on interface: {self.interface}")
+train_processed.to_csv("train_preprocessed.csv", index=False)
+test_processed.to_csv("test_preprocessed.csv", index=False)
 
-    def _sniff_packets(self):
-        sniff(iface=self.interface, prn=self.packet_callback, stop_filter=lambda x: self.stop_event.is_set(),
-              store=False)
-        
-    def stop_capture(self):
-        self.stop_event.set()
-        if self.capture_thread:
-            self.capture_thread.join(timeout=5)
-            print("Packet capture stopped.")
 
-    def get_captured_packets(self):
-        return dict(self.packet_stats), list(self.packet_queue.queue)
+print("\n전처리 완료")
+print("train_processed shape:", train_processed.shape)
+print("test_processed shape:", test_processed.shape)
+
+print("\ntrain label counts:")
+print(train_processed["Label"].value_counts())
+
+print("\ntest label counts:")
+print(test_processed["Label"].value_counts())
