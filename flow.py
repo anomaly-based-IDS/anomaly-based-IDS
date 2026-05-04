@@ -47,7 +47,7 @@ FEATURE_NAMES = [
     "duration",
     "pkt_count",
     "byte_count",
-    "iat_mean",     
+    "iat_mean",     # iat(inter-arrival time)
     "iat_std",
     "iat_min",
     "iat_max",
@@ -75,7 +75,6 @@ class FlowRecord:
     """
     flow_key:  FlowKey
     features:  np.ndarray          # shape (len(FEATURE_NAMES),)
-    packets:   list[Packet]
     label:     Optional[str] = None
 
     @property
