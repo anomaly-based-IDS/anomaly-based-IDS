@@ -30,12 +30,12 @@ def tmp_dir(tmp_path):
 
 def make_tcp_packet(src="192.168.1.1", dst="10.0.0.2", sport=1234, dport=80, flags="PA", ts=None):
     pkt = IP(src=src, dst=dst) / TCP(sport=sport, dport=dport, flags=flags)
-    pkt.time = ts or time.time()
+    pkt.time = ts if ts is not None else time.time()
     return pkt
 
 def make_udp_packet(src="192.168.1.1", dst="10.0.0.2", sport=5000, dport=53, ts=None):
     pkt = IP(src=src, dst=dst) / UDP(sport=sport, dport=dport)
-    pkt.time = ts or time.time()
+    pkt.time = ts if ts is not None else time.time()
     return pkt
 
 def write_test_pcap(path: str, packets: list) -> None:
@@ -144,6 +144,20 @@ class TestPacketBuffer:
         assert buf.peek("flow-old") == []
         assert len(buf.peek("flow-new")) == 1
 
+    # 버퍼 상태가 올바르게 반환되는지 테스트
+    def test_stats_returns_correct_counts(self):
+        buf = PacketBuffer(evict_interval=0)
+        assert buf.stats.active_flows == 0
+
+        for i in range(3):
+            buf.add("flow-A", make_tcp_packet())
+        for i in range(5):
+            buf.add("flow-B", make_tcp_packet())
+
+        s = buf.stats.active_flows
+        assert s == 2
+        assert len(buf.peek("flow-A")) == 3
+        assert len(buf.peek("flow-B")) == 5
     
 # AttackPacketWirter 단위 테스트
 class TestAttackPacketWriter:
@@ -272,7 +286,7 @@ class TestCsvFlowReader:
         assert len(records) == 1
         assert records[0].label == "BENIGN"
 
-    # featuresr 길이가 FEATURE_NAMES와 일치하는지 테스트
+    # features 길이가 FEATURE_NAMES와 일치하는지 테스트
     def test_feature_vector_length(self, tmp_dir):
         path = os.path.join(tmp_dir, "test.csv")
         make_test_csv(path, [default_csv_row()])
@@ -335,3 +349,46 @@ class TestBufferToWriterIntegration:
 
         flushed = buf.flush(flow_events[0].flow_id)
         assert len(flushed) == 3
+
+# _FlowAccumulator 단위 테스트
+class TestFlowAccumulator:
+ 
+    def _make_key(self):
+        return FlowKey("1.1.1.1", "2.2.2.2", 1234, 80, "TCP")
+
+    # 패킷이 하나인 경우 feature 값이 올바르게 계산되는지 테스트
+    def test_feature_values_single_packet(self):
+        acc = _FlowAccumulator(self._make_key())
+        acc.add(make_tcp_packet(flags="PA", ts=1.0))
+        event = acc.to_flow_event()
+ 
+        feat = dict(zip(FEATURE_NAMES, event.features))
+        assert feat["duration"] == 0.0
+        assert feat["pkt_count"] == 1.0
+        assert feat["iat_mean"] == 0.0
+ 
+    # 패킷이 여러 개인 경우 duration, pkt_count, iat_mean 등이 올바르게 계산되는지 테스트
+    def test_feature_values_multiple_packets(self):
+        acc  = _FlowAccumulator(self._make_key())
+        for i in range(5):
+            acc.add(make_tcp_packet(flags="PA", ts=float(i)))
+        event = acc.to_flow_event()
+ 
+        feat = dict(zip(FEATURE_NAMES, event.features))
+        assert feat["duration"]  == pytest.approx(4.0)
+        assert feat["pkt_count"] == 5.0
+ 
+    # TCP 플래그 카운트가 올바르게 계산되는지 테스트
+    def test_tcp_flag_counts(self):
+        acc = _FlowAccumulator(self._make_key())
+        acc.add(make_tcp_packet(flags="S",  ts=1.0))   # SYN
+        acc.add(make_tcp_packet(flags="PA", ts=2.0))   # PSH+ACK
+        acc.add(make_tcp_packet(flags="FA", ts=3.0))   # FIN+ACK
+ 
+        event = acc.to_flow_event()
+        feat  = dict(zip(FEATURE_NAMES, event.features))
+ 
+        assert feat["tcp_flag_syn"] == 1.0
+        assert feat["tcp_flag_fin"] == 1.0
+        assert feat["tcp_flag_psh"] == 1.0
+        assert feat["tcp_flag_ack"] == 2.0
