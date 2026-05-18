@@ -7,7 +7,7 @@ pcap 파일을 읽어 FlowRecord 형식으로 변환한다.
 """
 
 import logging
-from dataclassess import dataclass
+from dataclasses import dataclass
 from typing import Generator, Optional, Iterator, Union
 import numpy as np
 from scapy.utils import PcapReader
@@ -91,7 +91,7 @@ class _FlowAccumulator:
         ], dtype=float)
 
         return FlowEvent(
-            flow_id=self.key.id(),
+            flow_id=self.key.to_id(),
             features=features,
             flow_key=self.key
         )
