@@ -2,8 +2,7 @@
 Sprint 1 Test
 pcap_reader, csv_reader, packet_buffer, attack_writer 단위 테스트
 
-pytest test/sprint1_test.py -v
-pytest test/sprint1_test.py -v -k "buffer" # 특정 모듈
+python -m pytest test/sprint1_test.py
 """
 
 import io
