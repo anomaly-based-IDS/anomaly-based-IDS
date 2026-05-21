@@ -1,78 +1,121 @@
-import pandas as pd
-import numpy as np
 import os
+import time
+import numpy as np
+
 from AnomalyDetector import AnomalyDetector
+from pcap_reader import PcapFlowReader
+from packet_buffer import PacketBuffer
+from attack_writer import AttackPacketWriter
 
-# 1. 경로 설정
-BASE_DIR = "MachineLearningCVE"
-TEST_FILE = "Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv"
-TEST_PATH = os.path.join(BASE_DIR, TEST_FILE)
+# 경로 설정 (실제 테스트할 pcap 파일 경로로 변경하세요)
+PCAP_FILE = "forTest_normal.pcap"
 MODEL_PATH = "anomaly_ids_model.pkl"
+OUTPUT_DIR = "./attack_pcaps"
 
-def run_test():
-    # 모델 초기화 및 로드
-    detector = AnomalyDetector()
-    if not os.path.exists(MODEL_PATH):
-        print("❌ 에러: 모델 파일이 없습니다. train_model.py를 먼저 실행하세요.")
-        return
-    detector.load_model(MODEL_PATH)
-
-    # 2. 데이터 로드 및 전처리
-    print(f"📅 데이터 로딩 시작: {TEST_FILE}...")
-    df = pd.read_csv(TEST_PATH, low_memory=False)
-    df.columns = df.columns.str.strip()
-
-    df_selected = df[detector.feature_names].copy()
-    df_selected = df_selected.apply(pd.to_numeric, errors='coerce')
-    df_selected = df_selected.replace([np.inf, -np.inf], 0).fillna(0)
-    X_test = df_selected.values.astype('float32')
-
-    # 3. 탐지 수행
-    print("🔍 탐지 수행 중... (잠시만 기다려 주세요)")
-    X_test_scaled = detector.scaler.transform(X_test)
+def process_batch(detector, buffer, writer, batch_records):
+    """마이크로 배치를 모델에 넣고 결과를 처리하는 핵심 함수"""
+    # 1. 1D 배열들을 묶어 모델 입력용 2D 행렬(Matrix)로 변환
+    feature_matrix = np.array([r.features for r in batch_records])
     
-    # Isolation Forest에서 이상치 점수(score_samples)를 직접 가져옴
-    scores = detector.model.score_samples(X_test_scaled)
-    predictions = detector.model.predict(X_test_scaled)
+    # 2. 모델 일괄 추론 (Micro-Batching)
+    predictions, scores, x_scaled = detector.predict_batch(feature_matrix)
+    
+    batch_anomaly_count = 0
+    
+    # 3. 판정 결과에 따른 버퍼 제어(Action)
+    for i, pred in enumerate(predictions):
+        flow_id = batch_records[i].flow_id
+        
+        # [핵심] 정상이든 공격이든 판정이 끝났으므로 버퍼에서 패킷을 빼냅니다 (메모리 확보)
+        pkts = buffer.flush(flow_id)
+        
+        if pred == -1: # 1차적으로 모델이 이상하다고 판정했을 때
+            # 먼저 확신도(Confidence)를 계산
+            confidence = float(1 / (1 + np.exp(-scores[i])))
+            
+            # ★ 60% 이상 확신할 때만 '진짜 탐지'로 인정하고 카운트 & 저장!
+            if confidence >= 0.3: 
+                batch_anomaly_count += 1  # 여기서만 카운트 증가!
+                reason = detector.get_anomaly_reason(x_scaled[i])
+                
+                extra_info = {
+                    "reason": reason,
+                    "confidence": confidence
+                }
+                
+                # AttackPacketWriter를 통해 pcap 파일과 json 메타데이터 저장
+                writer.write(
+                    flow_id=flow_id, 
+                    packets=pkts, 
+                    anomaly_score=float(scores[i]), 
+                    extra=extra_info
+                )
+            
+    return batch_anomaly_count
 
-    # 4. 결과 요약 (중복 없이 한 번만 출력하도록 구성)
-    total = len(predictions)
-    anomalies = np.count_nonzero(predictions == -1)
-    normal = np.count_nonzero(predictions == 1)
+def run_pipeline():
+    if not os.path.exists(MODEL_PATH):
+        print(f"에러: {MODEL_PATH} 가 없습니다. 모델을 먼저 학습하세요.")
+        return
+        
+    print(f"실시간 패킷 분석 파이프라인 시작: {PCAP_FILE}")
+    start_time = time.time()
 
+    # 1. 파이프라인 컴포넌트 초기화
+    detector = AnomalyDetector(model_path=MODEL_PATH)
+    detector.load_model()
+    
+    reader = PcapFlowReader(idle_timeout=120.0)
+    buffer = PacketBuffer(max_packets_per_flow=5000, evict_interval=0) 
+    writer = AttackPacketWriter(output_dir=OUTPUT_DIR)
+    
+    # 마이크로 배치 설정
+    BATCH_SIZE = 100 
+    batch_records = []
+    
+    total_flows = 0
+    anomaly_count = 0
+    skip_count = 0
+    # ★ 테스트 시간 단축을 위한 제한 설정
+    MAX_TEST_FLOWS = 5000
+    
+    # 2. PCAP 스트리밍 및 마이크로 배치 루프
+    for record in reader.read(PCAP_FILE):
+        # A. 패킷을 버퍼에 저장 (팀원의 역할 시뮬레이션)
+        for pkt in record.packets:
+            buffer.add(record.flow_id, pkt)
+            
+        # B. 추출된 플로우 피처를 대기열에 추가
+        batch_records.append(record)
+        
+        # C. 윈도우 크기(BATCH_SIZE)에 도달하면 일괄 판정
+        if len(batch_records) >= BATCH_SIZE:
+            anomaly_count += process_batch(detector, buffer, writer, batch_records)
+            total_flows += len(batch_records)
+            batch_records.clear() # 배치 비우기
+            
+            if total_flows % 1000 == 0:
+                print(f"처리 진행 중... (현재 {total_flows}개 플로우 검사, 탐지: {anomaly_count}개)")
+
+            # ★ 5만 개 검사 완료 시 무한 루프 탈출!
+            if total_flows >= MAX_TEST_FLOWS:
+                print(f"\n테스트 시간 단축을 위해 {MAX_TEST_FLOWS:,}개 검사 후 조기 종료합니다!")
+                break 
+
+    # 3. 루프 종료 후 남은 자투리 데이터 처리
+    if batch_records:
+        anomaly_count += process_batch(detector, buffer, writer, batch_records)
+        total_flows += len(batch_records)
+        batch_records.clear()
+        
+    elapsed = time.time() - start_time
     print("\n" + "="*50)
-    print(f"🚀 [최종 탐지 결과 보고서]")
-    print("-" * 50)
-    print(f"1. 전체 데이터 수   : {total:,}건")
-    print(f"2. 정상 판정        : {normal:,}건")
-    print(f"3. 이상 탐지(공격)  : {anomalies:,}건")
-    print(f"4. 최종 탐지율      : {(anomalies/total)*100:.2f}%")
+    print("[실시간 탐지 파이프라인(마이크로 배치) 종료]")
+    print(f"▶ 총 처리 플로우 : {total_flows:,}건")
+    print(f"▶ 탐지된 공격    : {anomaly_count:,}건 (탐지율: {(anomaly_count/total_flows)*100:.2f}%)")
+    print(f"▶ 소요 시간      : {elapsed:.2f}초")
+    print(f"▶ 패킷 저장 경로 : {OUTPUT_DIR}")
     print("="*50)
 
-    # 5. [업그레이드] 이상 탐지 사유 분석 (신뢰도 높은 순 상위 5개)
-    anomaly_indices = np.where(predictions == -1)[0]
-    
-    if len(anomaly_indices) > 0:
-        # 이상치들의 신뢰도 점수만 따로 모아서 정렬
-        # score_samples는 낮을수록 더 이상한 놈이므로, 가장 낮은 순서대로 인덱스 정렬
-        anomaly_scores = scores[anomaly_indices]
-        top_anomaly_indices = anomaly_indices[np.argsort(anomaly_scores)[:5]]
-
-        print("\n🕵️ [이상 탐지 상세 분석 - 모델 확신도 기준 Top 5]")
-        print("-" * 75)
-        for i in top_anomaly_indices:
-            flow_sample = dict(zip(detector.feature_names, X_test[i]))
-            # AnomalyDetector의 predict_anomaly 활용
-            _, conf, reason = detector.predict_anomaly(flow_sample)
-            actual = df.iloc[i]['Label'] if 'Label' in df.columns else "N/A"
-            
-            print(f"-> 원인: {reason:20} | 신뢰도: {conf:.2f} | 실제: {actual}")
-        print("-" * 75)
-
-    # 6. 실제 라벨 분포 확인
-    if 'Label' in df.columns:
-        print("\n📝 [데이터셋 실제 라벨 분포]")
-        print(df['Label'].value_counts())
-
 if __name__ == "__main__":
-    run_test()
+    run_pipeline()

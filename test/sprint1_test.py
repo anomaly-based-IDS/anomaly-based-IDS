@@ -5,10 +5,8 @@ pcap_reader, csv_reader, packet_buffer, attack_writer 단위 테스트
 python -m pytest test/sprint1_test.py
 """
 
-import io
 import json
 import os
-import tempfile
 import time
 
 import numpy as np
@@ -19,7 +17,6 @@ from scapy.utils import PcapWriter, rdpcap
 
 from flow import FlowKey, FlowRecord, FEATURE_NAMES
 from packet_buffer import PacketBuffer
-from csv_reader import CsvFlowReader
 from pcap_reader import PcapFlowReader, PacketEvent, FlowEvent, _FlowAccumulator
 from attack_writer import AttackPacketWriter
 
@@ -272,43 +269,6 @@ class TestPcapFlowReader:
 
         assert len(flow_events) == 2
 
-
-# CsvFlowReader 단위 테스트
-class TestCsvFlowReader:
-
-    # csv 파일에서 FlowRecord를 올바르게 생성하는지 테스트
-    def test_basic_read(self, tmp_dir):
-        path = os.path.join(tmp_dir, "test.csv")
-        make_test_csv(path, [default_csv_row(label="BENIGN")])
-
-        records = list(CsvFlowReader().read(path))
-
-        assert len(records) == 1
-        assert records[0].label == "BENIGN"
-
-    # features 길이가 FEATURE_NAMES와 일치하는지 테스트
-    def test_feature_vector_length(self, tmp_dir):
-        path = os.path.join(tmp_dir, "test.csv")
-        make_test_csv(path, [default_csv_row()])
-
-        records = list(CsvFlowReader().read(path))
-        
-        assert records[0].features.shape == (len(FEATURE_NAMES),)
-
-    # IP, 포트, 프로토콜이 FlowKey에 올바르게 파싱되는지 테스트
-    def test_flow_id_fields_parsed(self, tmp_dir):
-        path = os.path.join(tmp_dir, "test.csv")
-        make_test_csv(path, [default_csv_row(
-            **{"Source IP": "10.0.0.1", "Destination IP": "172.16.0.1", "Source Port": 9999, "Destination Port": 443, "Protocol": 6}
-        )])
-
-        record = list(CsvFlowReader().read(path))[0]
-
-        assert record.flow_key.src_ip == "10.0.0.1"
-        assert record.flow_key.dst_ip   == "172.16.0.1"
-        assert record.flow_key.src_port == 9999
-        assert record.flow_key.dst_port == 443
-        assert record.flow_key.protocol == "OTHER"
 
 # Buffer -> Writer 통합 테스트
 class TestBufferToWriterIntegration:
