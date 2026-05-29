@@ -1,17 +1,14 @@
 """
-pcap/csv 로 읽어옴
--> reader에서 flowRecord 형식으로 변환
--> flowRecord에서 feature를 isolation forest 모델로 전달
--> .predict(feature)로 공격탐지해서 flush로 탐지된 id 전달
--> attack writer가 기록
+
+python pipeline.py
+로 실행
 
 """
 
 import logging
-from typing import Optional
-
 import numpy as np
 
+from AnomalyDetector import AnomalyDetector
 from pcap_reader import PcapFlowReader, PacketEvent, FlowEvent
 from packet_buffer import PacketBuffer
 from attack_writer import AttackPacketWriter
@@ -22,40 +19,31 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class AnomalyModel(Protocol):
-    # Isolation Forest 모델 인터페이스
-    
-    def predict(self, features: np.ndarray) -> bool:
-        ...
-    
-    def score(self, features: np.ndarray) -> float:
-        ...
-
 class AttackCapturePipeline:
-    """
-    Parameters:
-    - model: AnomalyModel 인터페이스 구현 객체
-    - max_packets: 버퍼 flow당 최대 패킷 수
-    - ttl_seconds: 버퍼 flow ttl
-    - output_dir: 공격 저장 경로
-    """
 
     def __init__(
         self,
-        model: AnomalyModel,
+        detector: AnomalyDetector,
         max_packets: int = 1000,
         ttl_seconds: float = 120.0,
         output_dir: str = "./attack_pcaps",
+        batch_size: int = 100,
+        confidence_threshold: float = 0.3,
+        idle_timeout: float = 120.0,
     ):
-        self.model = model
+        self.detector = detector
         self.buffer = PacketBuffer(max_packets, ttl_seconds)
         self.writer = AttackPacketWriter(output_dir)
-        self._reader = PcapFlowReader()
+        self._reader = PcapFlowReader(idle_timeout=idle_timeout)
+        self.batch_size = batch_size
+        self.confidence_threshold = confidence_threshold
 
     # pcap streaming
-    def run_pcap(self, pcap_path: str) -> None:
+    def run_pcap(self, pcap_path: str, max_flows: int = 0) -> None:
         logger.info("=== pcap 스트리밍 시작: %s ===", pcap_path)
-        pkt_count = flow_count = attack_count = 0
+        
+        batch_queue: list[FlowEvent] = []
+        total_flows = pkt_count = attack_count = 0
 
         for event in self._reader.stream(pcap_path):
             # 패킷을 버퍼에 추가
@@ -64,14 +52,39 @@ class AttackCapturePipeline:
                 pkt_count += 1
             # flow 완성 -> 모델 예측 -> 공격 판단 -> 공격 저장
             elif isinstance(event, FlowEvent):
-                flow_count += 1
-                if self._judge(event):
-                    attack_count += 1
-        
+                batch_queue.append(event)
+
+                if len(batch_queue) >= self.batch_size:
+                    attack_count += self._process_batch(batch_queue)
+                    total_flows += len(batch_queue)
+                    batch_queue.clear()
+
+                    if total_flows % 1000 == 0:
+                        logger.info(
+                            "진행 중... flow=%d | 공격=%d | 버퍼=%d flows",
+                            total_flows, attack_count, self.buffer.active_flow_count()
+                        )
+
+                    if max_flows > 0 and total_flows >= max_flows:
+                        logger.info("조기종료: %d flows 처리 완료", max_flows)
+                        break
+
+        # 마지막 배치 처리
+        if batch_queue:
+            attack_count += self._process_batch(batch_queue)
+            total_flows += len(batch_queue)
+            batch_queue.clear()
+
+        result = {
+            "total_flows": total_flows,
+            "attack_count": attack_count,
+            "total_packets": pkt_count,
+        }
         logger.info(
-            "=== pcap 스트리밍 완료: %s | 총 패킷=%d | 완성 flow=%d | 탐지된 공격=%d ===",
-            pkt_count, flow_count, attack_count
+            "=== pcap 스트리밍 완료 | 총 패킷=%d | 완성 flow=%d | 탐지된 공격=%d (%.2f%%)===",
+            pkt_count, total_flows, attack_count, (attack_count / total_flows * 100) if total_flows > 0 else 0.0,
         )
+        return result
                 
 
     def stats(self):
@@ -80,51 +93,64 @@ class AttackCapturePipeline:
             "active_flows": s.active_flows,
             "total_added": s.total_added,
             "total_flushed": s.total_flushed,
-            "total evicted": s.total_evicted,
+            "total_evicted": s.total_evicted,
         }
     
 
-    def _judge(self, event: FlowEvent) -> bool:
-        is_attack = self.model.predict(event.features)
-        if is_attack:
-            score = self.model.score(event.features)
-            packets = self.buffer.flush(event.flow_id)
-            self.writer.write(
-                flow_id=event.flow_id,
-                packets=packets,
-                anomaly_score=score,
-            )
-            logger.info(
-                "공격 탐지: %s | score=%.4f | flushed_pkts=%d",
-                event.flow_id, score, len(packets)
-            )
-        return is_attack
-    
+    def _process_batch(self, batch: list[FlowEvent]) -> int:
+        feature_matrix = np.array([e.features for e in batch])
+        predictions, scores, x_scaled = self.detector.predict_batch(feature_matrix)
+        attack_count = 0
 
-# 동작
+        for i, pred in enumerate(predictions):
+            flow_id = batch[i].flow_id
+            pkts = self.buffer.flush(flow_id)
+
+            if pred == -1:
+                confidence = float(1 / (1.0 / (1.0 + np.exp(-scores[i]))))
+                attack_count += 1
+                reason = self.detector.get_anomaly_reason(x_scaled[i])
+
+                self.writer.write(
+                    flow_id=flow_id,
+                    packets=pkts,
+                    anomaly_score=float(scores[i]),
+                    extra={"reason": reason, "confidence": confidence},
+                )
+                logger.info("탐지된 공격 %s | score=%.4f | confidence=%.2f | %s | %d pkts",
+                            flow_id, scores[i], confidence, reason, len(pkts))
+                
+        return attack_count
+
+
 if __name__ == "__main__":
-    import time
-    from sklearn.ensemble import IsolationForest
-    from scapy.layers.inet import IP, TCP   
-    from flow import FEATURE_NAMES, FlowKey
-    from pcap_reader import FlowEvent
+    from AnomalyDetector import AnomalyDetector as Detector
 
-    # 더미 모델
-    class IForestModel:
-        def __init__(self, threshold: float = 0.0):
-            self.threshold = threshold
-            self._iforest = IsolationForest(contamination=0.1, random_state=42)
-            self._iforest.fit(np.random.rand(100, len(FEATURE_NAMES)))  # 랜덤 데이터로 학습
+    PCAP_FILE = "forTest.pcap"
+    MODEL_PATH = "anomaly_ids_model.pkl"
+    OUTPUT_DIR = "./attack_pcaps"
 
-        def predict(self, features: np.ndarray) -> bool:
-            return self.score(features) < self.threshold
-        
-        def score(self, features: np.ndarray) -> float:
-            return float(self._iforest.score_samples(features.reshape(1, -1))[0])
-        
-    # 파이프라인 생성
+    detector = Detector(model_path=MODEL_PATH)
+    detector.load_model()
+
     pipeline = AttackCapturePipeline(
-        model=IForestModel(threshold=0.0),
-        output_dir="./attack_pcaps_test",
+        detector=detector,
+        max_packets=1000,
+        ttl_seconds=120.0,
+        output_dir=OUTPUT_DIR,
+        batch_size=100,
+        confidence_threshold=0.3,
+        idle_timeout=120.0,
     )
 
+    result = pipeline.run_pcap(PCAP_FILE, max_flows=5000)
+
+    print("\n" + "=" * 50)
+    print("[파이프라인 종료]")
+    print(f"▶ 총 처리 플로우 : {result['total_flows']:,}건")
+    print(f"▶ 탐지된 공격    : {result['attack_count']:,}건 "
+          f"(탐지율: {result['attack_count']/result['total_flows']*100:.2f}%)"
+          if result['total_flows'] > 0 else "▶ 처리된 flow 없음")
+    print(f"▶ 총 패킷        : {result['total_packets']:,}개")
+    print(f"▶ 저장 경로      : {OUTPUT_DIR}")
+    print("=" * 50)

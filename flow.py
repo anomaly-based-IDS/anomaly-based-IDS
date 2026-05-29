@@ -5,7 +5,7 @@ FlowRecord  : 완성된 flow 1개 (피처 벡터 + 패킷 목록)
 FlowKey     : 5-tuple 식별자 (딕셔너리 key)
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 import numpy as np
 from scapy.packet import Packet
@@ -38,7 +38,6 @@ class FlowKey:
         return cls(pkt[IP].src, pkt[IP].dst, sport, dport, proto)
 
     def to_id(self) -> str:
-        """고유의 Flow ID를 문자열로 생성"""
         return f"{self.src_ip}:{self.src_port}-{self.dst_ip}:{self.dst_port}-{self.protocol}"
 
 
@@ -71,11 +70,9 @@ class FlowRecord:
     - features  : Isolation Forest 입력 벡터 (FEATURE_NAMES 순서)
     - packets   : PacketBuffer.add()에 넘길 scapy Packet 목록
     - flow_id   : 두 컴포넌트 공통 식별자
-    - label     : csv에서 읽은 정답 레이블 (평가용, 없으면 None)
     """
     flow_key:  FlowKey
     features:  np.ndarray          # shape (len(FEATURE_NAMES),)
-    label:     Optional[str] = None
 
     @property
     def flow_id(self) -> str:
