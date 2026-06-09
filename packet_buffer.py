@@ -9,13 +9,14 @@ Flow별 패킷을 메모리에 보관하고,
 """
 
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 import threading
 import time
 import logging
 
 from scapy.packet import Packet
+from scapy.layers.inet import IP
 
 logger = logging.getLogger(__name__)
 
@@ -167,3 +168,64 @@ class PacketBuffer:
                 self.evict_expired()
             except Exception:
                 logger.exception("GC 중 예외 발생")
+
+class ContextBuffer:
+    """
+    공격 탐지 시점의 컨텍스트 정보를 보관하는 버퍼.
+    
+    모든 패킷을 수신 순서대로 (timestamp, packet) 형태로 저장
+    """
+    def __init__(
+        self,
+        before_sec: float = 10.0,
+        after_sec: float = 10.0,
+        max_duration: float = 300.0,
+    ):
+        self.before_sec = before_sec
+        self.after_sec = after_sec
+        self.max_duration = max_duration
+
+        self._timeline: deque[tuple[float, Packet]] = deque()
+        self._lock = threading.Lock()
+
+    # 공개 API
+
+    def add(self, packet: Packet, timestamp: Optional[float] = None) -> None:
+        ts = timestamp if timestamp is not None else time.time()
+        with self._lock:
+            self._timeline.append((ts, packet))
+            self._evict_old(ts)
+
+    def get_context(
+        self,
+        src_ip: str,
+        dst_ip: str,
+        attack_start: float,
+        attack_end: float,
+    ) -> list[Packet]:
+        t_from = attack_start - self.before_sec
+        t_to = attack_end + self.after_sec
+
+        result = []
+        with self._lock:
+            for ts, pkt in self._timeline:
+                if ts < t_from:
+                    continue
+                if ts > t_to:
+                    break
+
+                if IP not in pkt:
+                    continue
+                pkt_src = pkt[IP].src
+                pkt_dst = pkt[IP].dst
+                if (pkt_src in (src_ip, dst_ip)) or (pkt_dst in (src_ip, dst_ip)):
+                    result.append(pkt)
+
+        return result
+    
+    # 내부 메서드
+
+    def _evict_old(self, now: float) -> None:
+        cutoff = now - self.max_duration
+        while self._timeline and self._timeline[0][0] < cutoff:
+            self._timeline.popleft()
