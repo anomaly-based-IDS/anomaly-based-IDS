@@ -2,6 +2,7 @@ attack_pcaps/
 anomaly_ids_model.pkl
 forTest.pcap
 forTest_normal.pcap
+demo_output/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
