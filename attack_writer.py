@@ -9,7 +9,7 @@ attack_writer.py
       └── metadata.json        ← 사후 분석을 위한 상세 메타 데이터
 
 metadata.json 구조:
-    - cpature_info: pcap 파일 정보
+    - capture_info: pcap 파일 정보
     - attack_flow: 탐지된 공격 flow 상세
     - detection: 모델 탐지 결과 (score, confidence, reason)
     - context: 컨텍스트 구간 정보 (전후 시간, 패킷 수) 
@@ -143,7 +143,7 @@ class ZeekAnalysis:
 class AttackMetadata:
     """최상위 메타데이터"""
     capture: CaptureInfo
-    attack: AttackFlowInfo
+    attack_flow: AttackFlowInfo
     detection: DetectionInfo
     context: ContextInfo
     zeek_analysis: ZeekAnalysis
@@ -487,7 +487,7 @@ class AttackPacketWriter:
                 capture_end      = to_iso(max(all_times)) if all_times else None,
                 duration_seconds = round(max(all_times) - min(all_times), 6) if all_times else 0,
             ),
-            attack=AttackFlowInfo(
+            attack_flow=AttackFlowInfo(
                 flow_id          = flow_id,
                 src_ip           = src_ip,
                 dst_ip           = dst_ip,
