@@ -1,6 +1,6 @@
 """
 Sprint 1 Test
-pcap_reader, csv_reader, packet_buffer, attack_writer 단위 테스트
+pcap_reader, packet_buffer, attack_writer 단위 테스트
 
 python -m pytest test/sprint1_test.py
 """
@@ -19,6 +19,8 @@ from flow import FlowKey, FlowRecord, FEATURE_NAMES
 from packet_buffer import PacketBuffer
 from pcap_reader import PcapFlowReader, PacketEvent, FlowEvent, _FlowAccumulator
 from attack_writer import AttackPacketWriter
+
+NO_ZEEK = "zeek-not-installed-for-tests"   # 테스트에서는 Zeek 실행을 건너뜀
 
 
 @pytest.fixture
@@ -161,29 +163,29 @@ class TestAttackPacketWriter:
 
     # write() 호출 시 pcap과 json 파일이 생성되는지 테스트
     def test_write_creates_pcap_and_json(self, tmp_dir):
-        writer = AttackPacketWriter(output_dir=tmp_dir)
+        writer = AttackPacketWriter(output_dir=tmp_dir, zeek_bin=NO_ZEEK)
         pkts = [make_tcp_packet(ts=time.time() + i * 0.1) for i in range(3)]
         
         save_dir = writer.write("192.168.1.1.:80-10.0.0.2:54321-TCP", pkts, anomaly_score=-0.5)
 
         assert save_dir is not None
-        assert os.path.exists(os.path.join(save_dir, "attack.pcap"))
+        assert os.path.exists(os.path.join(save_dir, "capture.pcap"))
         assert os.path.exists(os.path.join(save_dir, "metadata.json"))
 
     # 저장된 pcap 파일의 패킷이 원본과 동일한지 테스트
     def test_pcap_contains_correct_packets(self, tmp_dir):
-        writer = AttackPacketWriter(output_dir=tmp_dir)
+        writer = AttackPacketWriter(output_dir=tmp_dir, zeek_bin=NO_ZEEK)
         pkts = [make_tcp_packet() for _ in range(5)]
 
         save_dir = writer.write("test-flow", pkts)
-        pcap_path = os.path.join(save_dir, "attack.pcap")
+        pcap_path = os.path.join(save_dir, "capture.pcap")
         loaded = rdpcap(pcap_path)
 
         assert len(loaded) == 5
 
     # 메타데이터 Json에 필수 필드가 모두 포함되어 생성되었는지 테스트
     def test_json_meatadata_fields(self, tmp_dir):
-        writer = AttackPacketWriter(output_dir=tmp_dir)
+        writer = AttackPacketWriter(output_dir=tmp_dir, zeek_bin=NO_ZEEK)
         pkts = [make_tcp_packet(src="1.2.3.4", dst="5.6.7.8", sport=9999, dport=80, ts=time.time() + i * 0.05) for i in range(3)]
 
         save_dir = writer.write("1.2.3.4:9999-5.6.7.8:80-TCP", pkts, anomaly_score=-0.42)
@@ -192,15 +194,34 @@ class TestAttackPacketWriter:
         with open(json_path) as f:
             meta = json.load(f)
 
-        assert meta["packet_count"]     == 3
-        assert meta["src_ip"]           == "1.2.3.4"
-        assert meta["dst_ip"]           == "5.6.7.8"
-        assert meta["src_port"]         == 9999
-        assert meta["dst_port"]         == 80
-        assert meta["protocol"]         == "TCP"
-        assert meta["anomaly_score"]    == pytest.approx(-0.42)
-        assert meta["total_bytes"]      > 0
-        assert meta["duration_seconds"] >= 0.0
+        flow = meta["attack_flow"]
+        assert set(meta) == {"capture", "attack_flow", "detection", "context", "zeek_analysis"}
+        assert flow["packet_count"]      == 3
+        assert flow["src_ip"]            == "1.2.3.4"
+        assert flow["dst_ip"]            == "5.6.7.8"
+        assert flow["src_port"]          == 9999
+        assert flow["dst_port"]          == 80
+        assert flow["protocol"]          == "TCP"
+        assert flow["total_bytes"]       > 0
+        assert flow["flow_duration_sec"] >= 0.0
+        assert meta["detection"]["anomaly_score"] == pytest.approx(-0.42)
+        assert meta["capture"]["duration_seconds"] >= 0.0
+        assert meta["zeek_analysis"]["error"]  # Zeek 미실행 사유가 기록됨
+
+    # 컨텍스트에 공격 패킷이 섞여 있어도 pcap에는 한 번만 저장되는지 테스트
+    def test_attack_packets_not_duplicated_with_context(self, tmp_dir):
+        writer = AttackPacketWriter(output_dir=tmp_dir, zeek_bin=NO_ZEEK)
+        atk = [make_tcp_packet(ts=10.0 + i) for i in range(3)]
+        other = [make_tcp_packet(sport=5555, ts=20.0 + i) for i in range(2)]
+
+        save_dir = writer.write("f", atk, context_packets=atk + other)
+
+        assert len(rdpcap(os.path.join(save_dir, "capture.pcap"))) == 5
+        with open(os.path.join(save_dir, "metadata.json")) as f:
+            meta = json.load(f)
+        assert meta["capture"]["attack_packets"] == 3
+        assert meta["capture"]["context_packets"] == 2
+        assert meta["capture"]["total_packets"] == 5
 
 
 # PcapFlowReader 단위 테스트
@@ -276,7 +297,7 @@ class TestBufferToWriterIntegration:
     # buffer에서 flush된 패킷이 writer에 의해 저장되는지 테스트
     def test_flushed_packets_saved_by_writer(self, tmp_dir):
         buf    = PacketBuffer(evict_interval=0)
-        writer = AttackPacketWriter(output_dir=tmp_dir)
+        writer = AttackPacketWriter(output_dir=tmp_dir, zeek_bin=NO_ZEEK)
  
         flow_id = "192.168.1.1:80-10.0.0.2:54321-TCP"
         pkts    = [make_tcp_packet(ts=float(i)) for i in range(5)]
@@ -287,10 +308,10 @@ class TestBufferToWriterIntegration:
         save_dir = writer.write(flow_id, flushed, anomaly_score=-0.35)
  
         assert save_dir is not None
-        assert len(rdpcap(os.path.join(save_dir, "attack.pcap"))) == 5
+        assert len(rdpcap(os.path.join(save_dir, "capture.pcap"))) == 5
         assert buf.active_flow_count() == 0
 
-    # pcap_reader의 PacketEvent.flow_id와 FlowEvent.flow_id이 일치하는지 테스트
+    # PacketEvent.uid 와 FlowEvent.uid 가 일치하고, 같은 5-tuple이라도 flow 인스턴스별로 분리되는지 테스트
     def test_pcap_reader_provides_correct_flow_id_for_buffer(self, tmp_dir):
         pcap_path = os.path.join(tmp_dir, "test.pcap")
         pkts      = [make_tcp_packet(flags="FA", ts=float(i)) for i in range(3)]
@@ -302,13 +323,29 @@ class TestBufferToWriterIntegration:
  
         for e in events:
             if isinstance(e, PacketEvent):
-                buf.add(e.flow_id, e.packet)
+                buf.add(e.uid, e.packet)
  
         flow_events = [e for e in events if isinstance(e, FlowEvent)]
         assert len(flow_events) == 3
+        assert len({e.flow_id for e in flow_events}) == 1      # 같은 5-tuple
+        assert len({e.uid for e in flow_events}) == 3          # 서로 다른 flow 인스턴스
 
-        flushed = buf.flush(flow_events[0].flow_id)
-        assert len(flushed) == 3
+        for fe in flow_events:
+            assert len(buf.flush(fe.uid)) == 1
+        assert buf.active_flow_count() == 0
+
+    # FlowEvent에 pcap 기준 flow 시작/종료 시각이 담기는지 테스트
+    def test_flow_event_has_pcap_timestamps(self, tmp_dir):
+        pcap_path = os.path.join(tmp_dir, "ts.pcap")
+        write_test_pcap(pcap_path, [
+            make_tcp_packet(flags="S", ts=5.0),
+            make_tcp_packet(flags="PA", ts=6.5),
+            make_tcp_packet(flags="FA", ts=8.0),
+        ])
+        fe = [e for e in PcapFlowReader(idle_timeout=999).stream(pcap_path)
+              if isinstance(e, FlowEvent)][0]
+        assert fe.flow_start == pytest.approx(5.0)
+        assert fe.flow_end == pytest.approx(8.0)
 
 # _FlowAccumulator 단위 테스트
 class TestFlowAccumulator:

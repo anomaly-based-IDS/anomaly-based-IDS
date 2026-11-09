@@ -7,7 +7,6 @@ from sklearn.preprocessing import RobustScaler
 # [수정 포인트 1] flow.py에서 정의된 고정 피처 리스트를 가져와 사용합니다.
 from flow import FEATURE_NAMES
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class AnomalyDetector:    
@@ -63,6 +62,24 @@ class AnomalyDetector:
         scores = self.model.score_samples(X_scaled)
         
         return predictions, scores, X_scaled
+
+    def get_confidence(self, scores):
+        """
+        score_samples() 점수를 0~1 범위의 '이상 확신도'로 변환한다.
+
+        score_samples 는 낮을수록 이상하며 범위는 [-1, 0] 이다.
+        모델은 score < offset_ 이면 이상(-1)으로 판정한다.
+
+            confidence = (offset_ - score) / (1 + offset_)   (0~1로 clip)
+
+        - 판정 경계(offset_)에 있으면 0, 가장 이상한 점수(-1)면 1
+        - 정상 판정 flow는 항상 0
+        - 점수가 낮을수록(더 이상할수록) confidence 가 커진다 (단조 증가)
+        """
+        scores = np.asarray(scores, dtype=float)
+        offset = float(self.model.offset_)
+        span = max(1.0 + offset, 1e-9)
+        return np.clip((offset - scores) / span, 0.0, 1.0)
 
     def get_anomaly_reason(self, scaled_feature_row):
         """특정 패킷이 공격으로 판정됐을 때, 가장 튀는 피처 이름 반환"""

@@ -10,7 +10,7 @@ Flow별 패킷을 메모리에 보관하고,
 
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import Optional
+from typing import Iterable, Optional
 import threading
 import time
 import logging
@@ -108,12 +108,12 @@ class PacketBuffer:
         with self._lock:
             entries = list(self._buffer.pop(flow_id, []))
             self._last_seen.pop(flow_id, None)
+            self.stats.total_flushed += len(entries)
             self.stats.active_flows = len(self._buffer)
 
         packets = [pkt for _, pkt in entries]
         if packets:
-            self.stats.total_flushed += len(packets)
-            logger.info(
+            logger.debug(
                 "[FLUSH] flow_id=%s | %d 패킷 반환",
                 flow_id, len(packets),
             )
@@ -198,11 +198,32 @@ class ContextBuffer:
 
     def get_context(
         self,
-        src_ip: str,
-        dst_ip: str,
-        attack_start: float,
-        attack_end: float,
+        src_ip: Optional[str] = None,
+        dst_ip: Optional[str] = None,
+        attack_start: Optional[float] = None,
+        attack_end: Optional[float] = None,
+        ips: Optional[Iterable[str]] = None,
+        exclude: Optional[set[int]] = None,
     ) -> list[Packet]:
+        """
+        [attack_start - before_sec, attack_end + after_sec] 구간에서
+        관련 IP가 src 또는 dst인 패킷을 시간순으로 반환한다.
+
+        Parameters
+        ----------
+        src_ip, dst_ip : 관련 IP (기존 호출 방식 호환)
+        ips            : 관련 IP 집합. 병합된 여러 공격의 IP를 한 번에 조회할 때 사용
+        exclude        : 결과에서 뺄 패킷의 id() 집합 (공격 패킷 중복 저장 방지)
+        """
+        if attack_start is None or attack_end is None:
+            return []
+
+        targets = set(ips or ())
+        targets.update(ip for ip in (src_ip, dst_ip) if ip)
+        if not targets:
+            return []
+        exclude = exclude or set()
+
         t_from = attack_start - self.before_sec
         t_to = attack_end + self.after_sec
 
@@ -213,16 +234,17 @@ class ContextBuffer:
                     continue
                 if ts > t_to:
                     break
-
-                if IP not in pkt:
+                if id(pkt) in exclude or IP not in pkt:
                     continue
-                pkt_src = pkt[IP].src
-                pkt_dst = pkt[IP].dst
-                if (pkt_src in (src_ip, dst_ip)) or (pkt_dst in (src_ip, dst_ip)):
+                if pkt[IP].src in targets or pkt[IP].dst in targets:
                     result.append(pkt)
 
         return result
-    
+
+    def latest_timestamp(self) -> Optional[float]:
+        with self._lock:
+            return self._timeline[-1][0] if self._timeline else None
+
     # 내부 메서드
 
     def _evict_old(self, now: float) -> None:

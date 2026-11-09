@@ -57,6 +57,8 @@ class AttackFlowInfo:
     flow_duration_sec: float
     total_bytes: int
     packet_count: int
+    merged_count: int = 1
+    merged_flows: list[str] = field(default_factory=list)
 
 @dataclass
 class DetectionInfo:
@@ -346,7 +348,7 @@ class AttackPacketWriter:
         self.after_sec = after_sec
         self.zeek = ZeekRunner(zeek_bin)
         os.makedirs(output_dir, exist_ok=True)
-        logger.info("AttackPacketWriter 초기화 | dir=%s | context=±%.0fs", output_dir, before_sec)
+        logger.info("AttackPacketWriter 초기화 | dir=%s | context=-%.0fs/+%.0fs", output_dir, before_sec, after_sec)
 
     # ------------------------------------------------------------------ #
     #  공개 API                                                            #
@@ -380,8 +382,10 @@ class AttackPacketWriter:
             logger.warning("[WRITE] flow_id=%s | 공격 패킷 없음, 저장 스킵", flow_id)
             return None
 
-        context_packets = context_packets or []
         extra = extra or {}
+        # 컨텍스트에 공격 패킷이 섞여 들어와도 한 번만 저장되도록 제거
+        attack_ids = {id(p) for p in attack_packets}
+        context_packets = [p for p in (context_packets or []) if id(p) not in attack_ids]
 
         save_dir = self._make_save_dir(flow_id)
         pcap_path = os.path.join(save_dir, "capture.pcap")
@@ -464,8 +468,10 @@ class AttackPacketWriter:
             src_port, dst_port, protocol = first[UDP].sport, first[UDP].dport, "UDP"
  
         def pkt_time(p: Packet) -> float:
-            try:    return float(p.time)
-            except: return 0.0
+            try:
+                return float(p.time)
+            except (AttributeError, TypeError, ValueError):
+                return 0.0
 
         def to_iso(ts: float) -> str:
             return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
@@ -499,6 +505,8 @@ class AttackPacketWriter:
                 flow_duration_sec= round(atk_end - atk_start, 6),
                 total_bytes      = sum(len(p) for p in attack_packets),
                 packet_count     = len(attack_packets),
+                merged_count     = int(extra.get("merged_count", 1)),
+                merged_flows     = list(extra.get("merged_flows", [flow_id])),
             ),
             detection=DetectionInfo(
                 detected_at    = datetime.now(tz=timezone.utc).isoformat(),

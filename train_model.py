@@ -2,7 +2,7 @@ import os
 import time
 import numpy as np
 from AnomalyDetector import AnomalyDetector
-from pcap_reader import PcapFlowReader
+from pcap_reader import PcapFlowReader, FlowEvent
 
 # 월요일 정상 트래픽 PCAP 파일 경로를 맞춰주세요.
 TRAIN_PCAP_FILE = "Monday-WorkingHours.pcap" 
@@ -23,14 +23,16 @@ def run_training():
     total_flows = 0
     MAX_FLOWS = 10000 # ★ 1만 개 플로우만 수집하고 강제 종료!
     
-    for record in reader.read(TRAIN_PCAP_FILE):
-        training_data.append(record.features)
+    for event in reader.stream(TRAIN_PCAP_FILE):
+        if not isinstance(event, FlowEvent):
+            continue
+        training_data.append(event.features)
         total_flows += 1
         
         if total_flows % 10000 == 0:
             print(f"🔄 플로우 추출 중... ({total_flows:,}개 완료)")
             
-        # ★ 50만 개가 모이면 무식한 10GB 읽기를 멈추고 루프 탈출
+        # MAX_FLOWS 개가 모이면 조기 종료 (전체 pcap은 수 GB)
         if total_flows >= MAX_FLOWS:
             print(f"\n🚨 파일이 너무 커서 {MAX_FLOWS:,}개 플로우만 추출하고 조기 종료합니다!")
             break
@@ -40,7 +42,7 @@ def run_training():
         return
 
     # 2. 추출된 데이터를 2D 행렬 (N, 16) 로 변환
-    X_train = np.array(training_data, dtype='float32')
+    X_train = np.nan_to_num(np.array(training_data, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
     print(f"✅ 데이터 추출 완료! 학습 데이터 차원: {X_train.shape}")
     print(f"소요 시간: {time.time() - start_time:.2f}초\n")
 
@@ -51,4 +53,6 @@ def run_training():
     detector.train(X_train)
 
 if __name__ == "__main__":
+    import logging
+    logging.basicConfig(level=logging.INFO)
     run_training()

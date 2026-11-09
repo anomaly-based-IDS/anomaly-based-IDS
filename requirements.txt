@@ -1,0 +1,7 @@
+scapy>=2.6
+numpy>=2.0
+pandas>=2.2
+# anomaly_ids_model.pkl 이 scikit-learn 1.8.0 으로 저장됨 — 버전이 다르면 경고/오동작 가능
+scikit-learn==1.8.0
+joblib>=1.4
+pytest>=8
