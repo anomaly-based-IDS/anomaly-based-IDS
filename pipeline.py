@@ -26,6 +26,7 @@ pcap 파일 기반 사후 분석 파이프라인 (마이크로 배치 + 배치 �
 """
 
 import logging
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -35,7 +36,6 @@ from AnomalyDetector import AnomalyDetector
 from pcap_reader import PcapFlowReader, PacketEvent, FlowEvent
 from packet_buffer import PacketBuffer, ContextBuffer
 from attack_writer import AttackPacketWriter
-from scapy.layers.inet import IP
 
 logger = logging.getLogger(__name__)
 
@@ -127,8 +127,12 @@ class AttackWindowManager:
     컨텍스트:
       - 윈도우에 포함된 모든 공격 flow의 IP를 대상으로 조회한다.
       - 공격 패킷 자체는 컨텍스트에서 제외한다.
-      - IP별로 이미 저장한 컨텍스트 구간을 기억해, 같은 패킷을 다른 이벤트에
-        다시 저장하지 않는다. (전체 저장 패킷 수 ≤ 전체 처리 패킷 수)
+
+    중복 저장 방지 (전체 저장 패킷 수 ≤ 전체 처리 패킷 수):
+      - 저장한 패킷을 retention_sec 동안 기억한다 (패킷 객체 참조를 유지해 id 재사용 방지).
+      - 이미 저장된 패킷은 컨텍스트뿐 아니라 공격 패킷에서도 뺀다.
+        앞 이벤트의 컨텍스트로 먼저 저장된 공격 패킷이 그 예다.
+        공격 패킷이 모두 이미 저장돼 있으면 새 이벤트를 만들지 않는다.
     """
 
     def __init__(
@@ -138,13 +142,17 @@ class AttackWindowManager:
         after_sec:      float,
         before_sec:     float = 0.0,
         max_window_sec: float = 60.0,
+        retention_sec:  float = 300.0,
     ):
         self.context_buffer = context_buffer
         self.writer         = writer
         self.after_sec      = after_sec
         self.before_sec     = before_sec
         self.max_window_sec = max_window_sec
-        self._saved_ranges: dict[str, tuple[float, float]] = {}   # ip → (from, to)
+        self.retention_sec  = retention_sec
+        self._saved_pkts: dict[int, object] = {}               # id(pkt) → pkt
+        self._saved_order: deque[tuple[float, int]] = deque()  # (저장 시각 기준 ts, id)
+        self.skipped_duplicates = 0                            # 공격 패킷 중 이미 저장돼 뺀 수
         self._current: list[_AttackEntry] = []
         self._pending: list[_AttackWindow] = []
         self.saved:    list[SavedWindow] = []
@@ -214,20 +222,29 @@ class AttackWindowManager:
             ids.update(id(p) for p in e.packets)
         return ids
 
-    def _already_saved(self, pkt) -> bool:
-        """이 패킷이 이전 이벤트의 컨텍스트로 이미 저장됐는지"""
-        ts = float(pkt.time)
-        ip = pkt[IP]
-        for addr in (ip.src, ip.dst):
-            rng = self._saved_ranges.get(addr)
-            if rng and rng[0] <= ts <= rng[1]:
-                return True
-        return False
+    def _remember_saved(self, pkts: list, now: float) -> None:
+        """저장한 패킷을 기록하고 retention_sec 보다 오래된 기록은 버린다."""
+        for p in pkts:
+            pid = id(p)
+            if pid not in self._saved_pkts:
+                self._saved_pkts[pid] = p
+                self._saved_order.append((float(p.time), pid))
+        cutoff = now - self.retention_sec
+        while self._saved_order and self._saved_order[0][0] < cutoff:
+            _, pid = self._saved_order.popleft()
+            self._saved_pkts.pop(pid, None)
 
     def _save_window(self, window: _AttackWindow) -> None:
-        atk_pkts = window.all_attack_packets
+        all_atk = window.all_attack_packets
+        atk_pkts = [p for p in all_atk if id(p) not in self._saved_pkts]
+        dup_atk = len(all_atk) - len(atk_pkts)
+        self.skipped_duplicates += dup_atk
+        n = len(window.entries)
+
         if not atk_pkts:
-            logger.warning("[WINDOW] 공격 패킷이 없는 윈도우 — 저장 스킵")
+            logger.info("[WINDOW] 공격 패킷 %d개가 모두 이전 이벤트에 저장돼 있음 — 저장 스킵",
+                        len(all_atk))
+            self.saved.append(SavedWindow(None, n, 0, 0))
             return
 
         ctx_pkts = self.context_buffer.get_context(
@@ -235,17 +252,10 @@ class AttackWindowManager:
             attack_start = window.window_start,
             attack_end   = window.window_end,
             # 이 윈도우와 아직 저장 전인 다른 윈도우의 공격 패킷은 컨텍스트에서 제외
-            exclude      = {id(p) for p in atk_pkts} | self._pending_attack_ids(),
+            exclude      = {id(p) for p in all_atk} | self._pending_attack_ids(),
         )
-        ctx_pkts = [p for p in ctx_pkts if not self._already_saved(p)]
-        t_from = window.window_start - self.before_sec
-        t_to   = window.window_end + self.after_sec
-        for addr in window.ips:
-            prev = self._saved_ranges.get(addr)
-            if prev and prev[1] >= t_from:                # 이어지는 구간이면 확장
-                self._saved_ranges[addr] = (min(prev[0], t_from), max(prev[1], t_to))
-            else:
-                self._saved_ranges[addr] = (t_from, t_to)
+        ctx_pkts = [p for p in ctx_pkts if id(p) not in self._saved_pkts]
+        self._remember_saved(atk_pkts + ctx_pkts, now=window.window_end + self.after_sec)
 
         n = len(window.entries)
         primary = window.primary_entry
@@ -263,6 +273,7 @@ class AttackWindowManager:
                 "reason":       primary.reason,
                 "merged_flows": [e.flow_id for e in window.entries],
                 "merged_count": n,
+                "duplicate_attack_packets_skipped": dup_atk,
             },
         )
         self.saved.append(SavedWindow(
@@ -346,6 +357,7 @@ class AttackCapturePipeline:
             after_sec      = context_after_sec,
             before_sec     = context_before_sec,
             max_window_sec = max_window_sec,
+            retention_sec  = context_max_duration,
         )
         if max_window_sec + context_before_sec + context_after_sec > context_max_duration:
             logger.warning(
@@ -417,7 +429,7 @@ class AttackCapturePipeline:
             "total_packets":         pkt_count,
             "total_flows":           total_flows,
             "attack_count":          attack_count,
-            "saved_events":          len(saved),
+            "saved_events":          sum(1 for s in saved if s.save_dir),
             "saved_attack_packets":  sum(s.attack_packets for s in saved),
             "saved_context_packets": sum(s.context_packets for s in saved),
             "saved_dirs":            [s.save_dir for s in saved if s.save_dir],

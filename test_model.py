@@ -18,7 +18,7 @@ from pipeline import AttackCapturePipeline
 
 def main():
     parser = argparse.ArgumentParser(description="모델 오탐률 점검")
-    parser.add_argument("--pcap", default="forTest_normal.pcap")
+    parser.add_argument("--pcap", default="Monday-WorkingHours.pcap", help="점검할 pcap 파일 경로")
     parser.add_argument("--model", default="anomaly_ids_model.pkl")
     parser.add_argument("--output", default="./attack_pcaps")
     parser.add_argument("--flows", type=int, default=5000, help="0이면 전체")

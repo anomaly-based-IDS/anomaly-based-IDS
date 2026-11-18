@@ -5,6 +5,13 @@ forTest_normal.pcap
 demo_output/
 sprint1_attack_pcaps/
 .DS_Store
+anomaly_ids_model.backup.pkl
+
+Monday-WorkingHours.pcap
+Tuesday-WorkingHours.pcap
+Wednesday-WorkingHours.pcap
+Thursday-WorkingHours.pcap
+Friday-WorkingHours.pcap
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

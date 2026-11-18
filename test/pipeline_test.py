@@ -212,6 +212,36 @@ class TestPipeline:
         assert len(stored) == result["saved_attack_packets"] + result["saved_context_packets"]
         assert len(stored) <= result["total_packets"]
 
+    def test_attack_packets_saved_as_earlier_context_not_duplicated(self, tmp_path):
+        """
+        긴 공격 flow B(t=0~30, 9.9.9.9 관련)가 늦게 끝나는 동안
+        짧은 공격 A(t=8)가 먼저 저장되면 B의 앞쪽 패킷이 A의 컨텍스트로 저장된다.
+        B 이벤트를 저장할 때 그 패킷들을 다시 저장하면 안 된다.
+        """
+        pkts = [pkt("2.2.2.2", "9.9.9.9", 2000, flags="PA", ts=float(t)) for t in range(0, 30, 2)]
+        pkts += [pkt("1.1.1.1", "9.9.9.9", 1000, flags=f, ts=8.0 + i * 0.1)
+                 for i, f in enumerate(["S", "PA", "FA"])]
+        pkts += [pkt("2.2.2.2", "9.9.9.9", 2000, flags="FA", ts=30.0)]
+        pkts += [pkt("7.7.7.7", "8.8.8.8", 4000 + i, flags="FA", ts=50.0 + i) for i in range(5)]
+        pkts.sort(key=lambda p: float(p.time))
+        path = str(tmp_path / "long.pcap")
+        write_pcap(path, pkts)
+
+        pipe = self._pipeline(tmp_path, batch_size=1)
+        pipe.window_manager.max_window_sec = 1.0          # A, B 를 별도 이벤트로
+        result = pipe.run_pcap(path)
+
+        stored = []
+        for d in result["saved_dirs"]:
+            stored += [(float(p.time), bytes(p)) for p in rdpcap(os.path.join(d, "capture.pcap"))]
+        assert result["saved_events"] == 2
+        assert len(stored) == len(set(stored))
+        assert len(stored) <= result["total_packets"]
+        assert pipe.window_manager.skipped_duplicates > 0
+        metas = [_read_meta(d) for d in result["saved_dirs"]]
+        assert sum(m["attack_flow"]["duplicate_attack_packets_skipped"] for m in metas) \
+            == pipe.window_manager.skipped_duplicates
+
     def test_same_five_tuple_flows_in_one_batch(self, tmp_path):
         # 같은 5-tuple로 FIN 패킷이 3번 → flow 인스턴스 3개. 예전에는 두 번째 flush가 비어 크래시가 났음
         path = str(tmp_path / "dup.pcap")

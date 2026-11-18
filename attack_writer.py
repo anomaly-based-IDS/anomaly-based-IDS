@@ -59,6 +59,8 @@ class AttackFlowInfo:
     packet_count: int
     merged_count: int = 1
     merged_flows: list[str] = field(default_factory=list)
+    # 앞 이벤트에 이미 저장돼 이 pcap에서 뺀 공격 패킷 수
+    duplicate_attack_packets_skipped: int = 0
 
 @dataclass
 class DetectionInfo:
@@ -507,6 +509,7 @@ class AttackPacketWriter:
                 packet_count     = len(attack_packets),
                 merged_count     = int(extra.get("merged_count", 1)),
                 merged_flows     = list(extra.get("merged_flows", [flow_id])),
+                duplicate_attack_packets_skipped = int(extra.get("duplicate_attack_packets_skipped", 0)),
             ),
             detection=DetectionInfo(
                 detected_at    = datetime.now(tz=timezone.utc).isoformat(),

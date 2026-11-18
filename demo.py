@@ -48,7 +48,7 @@ parser = argparse.ArgumentParser(description="IDS 파이프라인 발표 시연"
 parser.add_argument("--pcap",   default="forTest.pcap",   help="분석할 pcap 파일")
 parser.add_argument("--model",  default="anomaly_ids_model.pkl", help="학습된 모델 파일")
 parser.add_argument("--output", default="./demo_output",         help="결과 저장 경로")
-parser.add_argument("--flows",  type=int, default=1000,           help="처리할 최대 flow 수")
+parser.add_argument("--flows",  type=int, default=10000,           help="처리할 최대 flow 수")
 parser.add_argument("--before", type=float, default=10.0,        help="컨텍스트 전방 구간(초)")
 parser.add_argument("--after",  type=float, default=10.0,        help="컨텍스트 후방 구간(초)")
 parser.add_argument("--threshold", type=float, default=0.0,      help="저장할 최소 confidence (0~1)")
