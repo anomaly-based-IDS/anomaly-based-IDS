@@ -3,6 +3,8 @@ anomaly_ids_model.pkl
 forTest.pcap
 forTest_normal.pcap
 demo_output/
+test_data/
+eval_runs/
 sprint1_attack_pcaps/
 .DS_Store
 anomaly_ids_model.backup.pkl
