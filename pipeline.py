@@ -28,7 +28,7 @@ pcap 파일 기반 사후 분석 파이프라인 (마이크로 배치 + 배치 �
 import logging
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -310,6 +310,8 @@ class AttackCapturePipeline:
     context_max_duration : ContextBuffer 전역 타임라인 보관 시간 (초)
     max_window_sec       : 병합된 공격 윈도우의 최대 길이 (초). context_max_duration 보다 작아야 함
     zeek_bin             : Zeek 실행 파일 경로
+    flow_callback        : (선택) flow 판정마다 호출 — callback(event, pred, score, confidence, flagged)
+                           flagged 는 실제로 공격으로 처리(윈도우에 push)됐는지 여부. 평가(evaluate.py)용
 
     PacketBuffer GC:
       pcap 모드에서는 모든 flow가 FIN/RST, idle timeout, EOF 중 하나로 반드시
@@ -331,6 +333,7 @@ class AttackCapturePipeline:
         context_max_duration:  float = 300.0,
         max_window_sec:        float = 60.0,
         zeek_bin:              str   = "zeek",
+        flow_callback:         Optional[Callable] = None,
     ):
         if not detector.is_trained:
             raise ValueError(
@@ -368,6 +371,7 @@ class AttackCapturePipeline:
         self._reader = PcapFlowReader(idle_timeout=idle_timeout)
         self.batch_size = batch_size
         self.confidence_threshold = confidence_threshold
+        self.flow_callback = flow_callback
 
     # ── pcap 실행 ─────────────────────────────────────────────────────
 
@@ -464,6 +468,10 @@ class AttackCapturePipeline:
             ev = batch[i]
             # 판정이 끝났으므로 정상/공격 모두 버퍼에서 꺼낸다 (메모리 해제)
             pkts = self.buffer.flush(ev.uid or ev.flow_id)
+
+            flagged = pred == -1 and confidences[i] >= self.confidence_threshold and bool(pkts)
+            if self.flow_callback is not None:
+                self.flow_callback(ev, int(pred), float(scores[i]), float(confidences[i]), flagged)
 
             if pred != -1 or confidences[i] < self.confidence_threshold:
                 continue
